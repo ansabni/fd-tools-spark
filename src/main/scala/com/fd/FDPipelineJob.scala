@@ -1,0 +1,463 @@
+package com.fd
+
+import org.apache.spark.{SparkConf, SparkContext}
+
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.{FileSystem, Path}
+
+import java.security.MessageDigest
+import java.util.Base64
+
+import scala.collection.mutable
+import scala.io.Source
+
+/**
+ * End-to-end FD mix pipeline (fd-tools) — MIX_MAPRULE_* env var edition.
+ *
+ * Reads stdtime.* footprint descriptor files from Linode Object Storage (S3),
+ * applies mix_maprule logic (via C++ JNI), and uploads the resulting
+ * stdtime.* output file back to S3.
+ *
+ * All S3 paths are provided via environment variables that mirror the
+ * mix_maprule binary's own env var convention:
+ *
+ *   MIX_MAPRULE_IDIR          S3 prefix for stdtime.* input files
+ *                               e.g. "Anirudh/fds"
+ *   MIX_MAPRULE_ODIR          S3 prefix for output upload
+ *                               e.g. "Anirudh/mix_output"
+ *   MIX_MAPRULE_CONFIG        S3 path to the config file
+ *                               e.g. "Anirudh/config.key2"
+ *   MIX_MAPRULE_SUFFIX        Output suffix (optional).
+ *                               Defaults to the config filename stripped of
+ *                               its .config extension (and .keyN suffix).
+ *   MIX_MAPRULE_THINNING_PCT_JUMP  Thinning pct (optional, default 0.0)
+ *
+ * Credentials / encryption:
+ *   S3_ACCESS_KEY             Linode access key
+ *   S3_SECRET_KEY             Linode secret key
+ *   S3_OUTPUT_KEY_INDEX       Key index used to encrypt uploaded output
+ *                               (default: smallest key index available)
+ *   S3_ENDPOINT               S3 endpoint (default: us-ord-10.linodeobjects.com)
+ *   FD_LOCAL_DEBUG_DIR        If set, intermediate files are also saved here
+ *
+ * Usage:
+ *   spark-submit --class com.fd.FDPipelineJob \
+ *     fd-spark_2.13-0.1.jar \
+ *     <s3Bucket> <encryptionKeysFile>
+ *
+ * Arguments:
+ *   s3Bucket            Linode bucket name
+ *   encryptionKeysFile  Path to JSON file: {"1": "<base64-key>", "2": "..."}
+ */
+object FDPipelineJob {
+
+  // Linode Object Storage endpoint — overridable via S3_ENDPOINT env var
+  def s3Endpoint: String = sys.env.getOrElse("S3_ENDPOINT", "us-ord-10.linodeobjects.com")
+
+  /**
+   * Extract the key index from an S3 path based on its .keyN suffix.
+   * e.g. "Anirudh/fds/stdtime.mm1.key2" → "2"
+   * Defaults to "1" if no .keyN suffix found.
+   */
+  def keyIndexFromPath(path: String): String = {
+    val pattern = """\.key(\d+)$""".r
+    pattern.findFirstMatchIn(path).map(_.group(1)).getOrElse("1")
+  }
+
+  /**
+   * Strip the .keyN suffix from a filename so C++ tools see the plain name.
+   * e.g. "stdtime.mm1.key2" → "stdtime.mm1"
+   */
+  def stripKeyN(name: String): String = name.replaceAll("""\.key\d+$""", "")
+
+  // -------------------------------------------------------------------------
+  // S3 helpers — same pattern as StackDistancePipelineJob in fd-compute-spark
+  // -------------------------------------------------------------------------
+
+  /**
+   * Load encryption keys from a JSON file.
+   * Format: {"1": "<base64-AES-key>", "2": "<base64-AES-key>"}
+   * No external JSON library needed — simple regex parse is sufficient.
+   */
+  def loadEncryptionKeys(path: String): Map[String, String] = {
+    val content = Source.fromFile(path).mkString
+    val pattern = """"(\w+)"\s*:\s*"([^"]+)"""".r
+    pattern.findAllMatchIn(content).map(m => m.group(1) -> m.group(2)).toMap
+  }
+
+  /**
+   * Build a Hadoop Configuration for S3A with SSE-C encryption.
+   * All reads and writes through this config will use the provided AES key.
+   */
+  def s3aConf(accessKey: String, secretKey: String, sseKeyB64: String): Configuration = {
+    val conf = new Configuration(false)
+    conf.set("fs.s3a.impl",                               "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    conf.set("fs.s3a.endpoint",                           s3Endpoint)
+    conf.set("fs.s3a.path.style.access",                  "true")
+    conf.set("fs.s3a.connection.ssl.enabled",             "true")
+    conf.set("fs.s3a.access.key",                         accessKey)
+    conf.set("fs.s3a.secret.key",                         secretKey)
+    conf.set("fs.s3a.server-side-encryption-algorithm",   "SSE-C")
+    conf.set("fs.s3a.server-side-encryption.key",         sseKeyB64)
+    val keyBytes = Base64.getDecoder.decode(sseKeyB64)
+    val md5B64   = Base64.getEncoder.encodeToString(
+                     MessageDigest.getInstance("MD5").digest(keyBytes))
+    conf.set("fs.s3a.server-side-encryption-key-md5",     md5B64)
+    conf.set("hadoop.tmp.dir", System.getProperty("java.io.tmpdir", "/tmp"))
+    conf
+  }
+
+  /**
+   * List all files under s3a://bucket/prefix.
+   * Returns full s3a:// paths. Skips directory placeholder entries.
+   */
+  def listS3Files(bucket: String, prefix: String, conf: Configuration): Seq[String] = {
+    val basePath = new Path(s"s3a://$bucket/$prefix")
+    val fs       = FileSystem.get(basePath.toUri, conf)
+    val buf      = mutable.ArrayBuffer[String]()
+    try {
+      val iter = fs.listFiles(basePath, /*recursive=*/ true)
+      while (iter.hasNext) {
+        val p = iter.next().getPath.toString
+        if (!p.endsWith("/")) buf += p
+      }
+    } finally fs.close()
+    buf.toSeq
+  }
+
+  /**
+   * Download a single S3 file to a local path.
+   */
+  def downloadS3File(s3Path: String, localPath: java.io.File, conf: Configuration): Unit = {
+    val path   = new Path(s3Path)
+    val fs     = FileSystem.get(path.toUri, conf)
+    val in     = fs.open(path)
+    val out    = new java.io.FileOutputStream(localPath)
+    try {
+      val buf = new Array[Byte](64 * 1024)
+      var n   = in.read(buf)
+      while (n > 0) { out.write(buf, 0, n); n = in.read(buf) }
+    } finally {
+      in.close()
+      out.close()
+      fs.close()
+    }
+  }
+
+  /**
+   * Upload a local file to S3.
+   */
+  def uploadToS3(localFile: java.io.File, s3Path: String, conf: Configuration): Unit = {
+    val path   = new Path(s3Path)
+    val fs     = FileSystem.get(path.toUri, conf)
+    val out    = fs.create(path, /*overwrite=*/ true)
+    val in     = new java.io.FileInputStream(localFile)
+    try {
+      val buf = new Array[Byte](64 * 1024)
+      var n   = in.read(buf)
+      while (n > 0) { out.write(buf, 0, n); n = in.read(buf) }
+    } finally {
+      in.close()
+      out.close()
+      fs.close()
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Main
+  // -------------------------------------------------------------------------
+
+  def main(args: Array[String]): Unit = {
+    if (args.length < 2) {
+      System.err.println(
+        "Usage: FDPipelineJob <s3Bucket> <encryptionKeysFile>\n" +
+        "\n" +
+        "S3 paths are provided via environment variables:\n" +
+        "  MIX_MAPRULE_IDIR          S3 prefix for stdtime.* input files\n" +
+        "  MIX_MAPRULE_ODIR          S3 prefix for output\n" +
+        "  MIX_MAPRULE_CONFIG        S3 path to config file\n" +
+        "  MIX_MAPRULE_SUFFIX        Output suffix (optional)\n" +
+        "  MIX_MAPRULE_THINNING_PCT_JUMP  Thinning pct (optional, default 0.0)\n" +
+        "\n" +
+        "Credentials:\n" +
+        "  S3_ACCESS_KEY, S3_SECRET_KEY, S3_OUTPUT_KEY_INDEX, S3_ENDPOINT\n"
+      )
+      System.exit(1)
+    }
+
+    val s3Bucket           = args(0)
+    val encryptionKeysFile = args(1)
+
+    val conf = new SparkConf().setAppName("FDPipelineJob")
+    if (!conf.contains("spark.master")) conf.setMaster("local[*]")
+
+    val sc = new SparkContext(conf)
+    try {
+      run(sc, s3Bucket, encryptionKeysFile)
+      println("Mix pipeline complete.")
+    } finally {
+      sc.stop()
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Pipeline
+  // -------------------------------------------------------------------------
+
+  def run(
+    sc:                 SparkContext,
+    s3Bucket:           String,
+    encryptionKeysFile: String
+  ): Unit = {
+
+    val accessKey = sys.env.getOrElse("S3_ACCESS_KEY",
+      throw new IllegalStateException("S3_ACCESS_KEY env var not set"))
+    val secretKey = sys.env.getOrElse("S3_SECRET_KEY",
+      throw new IllegalStateException("S3_SECRET_KEY env var not set"))
+
+    // ------------------------------------------------------------------
+    // Read MIX_MAPRULE_* env vars
+    // ------------------------------------------------------------------
+    val mixIdirRaw   = sys.env.getOrElse("MIX_MAPRULE_IDIR",
+      throw new IllegalStateException("MIX_MAPRULE_IDIR env var not set"))
+    val mixOdirRaw   = sys.env.getOrElse("MIX_MAPRULE_ODIR",
+      throw new IllegalStateException("MIX_MAPRULE_ODIR env var not set"))
+    val mixConfigKey = sys.env.getOrElse("MIX_MAPRULE_CONFIG",
+      throw new IllegalStateException("MIX_MAPRULE_CONFIG env var not set"))
+
+    // Strip any leading "s3://<bucket>/" or "s3a://<bucket>/" to get bare S3 keys
+    val stripBucketPrefix = { raw: String =>
+      val s3Pattern = s"^s3a?://${java.util.regex.Pattern.quote(s3Bucket)}/".r
+      s3Pattern.replaceFirstIn(raw, "")
+    }
+    val mixIdir    = stripBucketPrefix(mixIdirRaw).stripSuffix("/")
+    val mixOdir    = stripBucketPrefix(mixOdirRaw).stripSuffix("/")
+    val mixCfgKey  = stripBucketPrefix(mixConfigKey)
+
+    val thinningPct = sys.env.get("MIX_MAPRULE_THINNING_PCT_JUMP")
+      .filter(_.nonEmpty).map(_.toDouble).getOrElse(0.0)
+
+    // ------------------------------------------------------------------
+    // Load encryption keys
+    // ------------------------------------------------------------------
+    val encryptionKeys = loadEncryptionKeys(encryptionKeysFile)
+    println(s"[DEBUG] Loaded ${encryptionKeys.size} encryption key(s) from $encryptionKeysFile")
+    encryptionKeys.keys.toSeq.sorted.foreach(k => println(s"[DEBUG]   key index $k loaded"))
+
+    // A conf that can list S3 (listing doesn't need SSE-C key content, only credentials)
+    val listConf = s3aConf(accessKey, secretKey, encryptionKeys(encryptionKeys.keys.min))
+
+    // ------------------------------------------------------------------
+    // Discover stdtime.* input files in S3 under MIX_MAPRULE_IDIR
+    // ------------------------------------------------------------------
+    println(s"[DEBUG] Scanning S3 for stdtime files under s3://$s3Bucket/$mixIdir ...")
+    val s3InputFiles = listS3Files(s3Bucket, mixIdir, listConf)
+      .filter(p => p.split("/").last.startsWith("stdtime"))
+    println(s"[DEBUG] Found ${s3InputFiles.size} stdtime file(s):")
+    s3InputFiles.foreach { f =>
+      val keyIdx    = keyIndexFromPath(f)
+      val localName = stripKeyN(f.split("/").last)
+      println(s"[DEBUG]   $f  →  local name: $localName  (key index: $keyIdx)")
+    }
+
+    // ------------------------------------------------------------------
+    // Download config from S3 (MIX_MAPRULE_CONFIG)
+    // ------------------------------------------------------------------
+    val cfgFileName  = mixCfgKey.split("/").last    // e.g. "config.key2"
+    val cfgKeyIdx    = keyIndexFromPath(cfgFileName)
+    val cfgLocalName = stripKeyN(cfgFileName)       // e.g. "config"
+
+    // Suffix: MIX_MAPRULE_SUFFIX if set, else derive from config filename
+    val suffix = sys.env.get("MIX_MAPRULE_SUFFIX").filter(_.nonEmpty)
+      .getOrElse(cfgLocalName.stripSuffix(".config"))
+
+    println(s"[DEBUG] Downloading config from S3: s3://$s3Bucket/$mixCfgKey  (key index: $cfgKeyIdx)")
+    val tmpCfg = java.io.File.createTempFile("fd_config_", ".tmp")
+    val configLines: String = try {
+      val cfgConf = s3aConf(accessKey, secretKey, encryptionKeys(cfgKeyIdx))
+      downloadS3File(s"s3a://$s3Bucket/$mixCfgKey", tmpCfg, cfgConf)
+      val lines = scala.io.Source.fromFile(tmpCfg).mkString
+      println(s"[DEBUG] Config file contents (${lines.linesIterator.size} lines):")
+      lines.linesIterator.foreach(l => println(s"[DEBUG]   $l"))
+      lines
+    } finally {
+      tmpCfg.delete()
+    }
+
+    println(s"[DEBUG] Output suffix         : '$suffix'  →  output file: stdtime.$suffix")
+    println(s"[DEBUG] MIX_MAPRULE_IDIR      : s3://$s3Bucket/$mixIdir")
+    println(s"[DEBUG] MIX_MAPRULE_ODIR      : s3://$s3Bucket/$mixOdir")
+    println(s"[DEBUG] MIX_MAPRULE_CONFIG    : s3://$s3Bucket/$mixCfgKey")
+    println(s"[DEBUG] Thinning pct          : $thinningPct")
+
+    // ------------------------------------------------------------------
+    // Key index for output encryption
+    // ------------------------------------------------------------------
+    val outKeyIdx = sys.env.get("S3_OUTPUT_KEY_INDEX").filter(_.nonEmpty)
+      .getOrElse(encryptionKeys.keys.toSeq.sorted.head)
+    println(s"[DEBUG] Output encryption key index: $outKeyIdx  (S3_OUTPUT_KEY_INDEX)")
+
+    // ------------------------------------------------------------------
+    // Optional local debug dir for intermediate files
+    // ------------------------------------------------------------------
+    val localDebugDir: Option[java.io.File] = sys.env.get("FD_LOCAL_DEBUG_DIR")
+      .filter(_.nonEmpty)
+      .map { p => val d = new java.io.File(p); d.mkdirs(); d }
+    localDebugDir match {
+      case Some(d) => println(s"[DEBUG] Intermediate files will be saved to: ${d.getAbsolutePath}")
+      case None    => println(s"[DEBUG] FD_LOCAL_DEBUG_DIR not set — intermediate files will not be saved locally")
+    }
+
+    // ------------------------------------------------------------------
+    // Broadcast everything to executors
+    // ------------------------------------------------------------------
+    val bcAccessKey      = sc.broadcast(accessKey)
+    val bcSecretKey      = sc.broadcast(secretKey)
+    val bcEncryptionKeys = sc.broadcast(encryptionKeys)
+    val bcS3InputFiles   = sc.broadcast(s3InputFiles)
+    val bcS3Bucket       = sc.broadcast(s3Bucket)
+    val bcMixOdir        = sc.broadcast(mixOdir)
+    val bcOutKeyIdx      = sc.broadcast(outKeyIdx)
+    val bcLocalDebugDir  = sc.broadcast(localDebugDir.map(_.getAbsolutePath))
+    val bcThinningPct    = sc.broadcast(thinningPct)
+
+    // ------------------------------------------------------------------
+    // MAP phase: single Spark task
+    //   1. Download all stdtime.* input files from S3
+    //   2. Run C++ mix (FDNative.runMix)
+    //   3. (optional) Copy to FD_LOCAL_DEBUG_DIR
+    //   4. Upload output to MIX_MAPRULE_ODIR encrypted with S3_OUTPUT_KEY_INDEX
+    //   5. Clean up temp dirs
+    // ------------------------------------------------------------------
+    val results: Array[(String, Int)] = sc.parallelize(Seq((suffix, configLines)), 1)
+      .map { case (suffix, configLines) =>
+
+        val ak            = bcAccessKey.value
+        val sk            = bcSecretKey.value
+        val keys          = bcEncryptionKeys.value
+        val inputFiles    = bcS3InputFiles.value
+        val bucket        = bcS3Bucket.value
+        val outputPfx     = bcMixOdir.value
+        val outKeyIdx     = bcOutKeyIdx.value
+        val debugDirPath  = bcLocalDebugDir.value
+        val thinningPct   = bcThinningPct.value
+
+        val taskId    = java.util.UUID.randomUUID().toString.take(8)
+        val localBase = new java.io.File(s"/tmp/fd_mix_$taskId")
+        val inputDir  = new java.io.File(localBase, "input")
+        val outputDir = new java.io.File(localBase, "output")
+        inputDir.mkdirs()
+        outputDir.mkdirs()
+
+        println(s"[$suffix] ── Starting mix task ──────────────────────────")
+        println(s"[$suffix] Task thread id   : $taskId")
+        println(s"[$suffix] Input files      : ${inputFiles.size}")
+        println(s"[$suffix] Local input dir  : ${inputDir.getAbsolutePath}")
+        println(s"[$suffix] Local output dir : ${outputDir.getAbsolutePath}")
+        println(s"[$suffix] Thinning pct     : $thinningPct")
+        println(s"[$suffix] Config lines:")
+        configLines.linesIterator.foreach(l => println(s"[$suffix]   $l"))
+
+        try {
+          // -- Stage 1: Download stdtime.* files using correct key per file --
+          println(s"[$suffix] Stage 1: Downloading ${inputFiles.size} input file(s) from S3...")
+          for (s3Path <- inputFiles) {
+            val rawName   = s3Path.split("/").last
+            val keyIdx    = keyIndexFromPath(rawName)
+            val localName = stripKeyN(rawName)
+            val localFile = new java.io.File(inputDir, localName)
+            println(s"[$suffix]   $rawName  →  ${localFile.getAbsolutePath}  (key index: $keyIdx)")
+            val dlConf = s3aConf(ak, sk, keys(keyIdx))
+            downloadS3File(s3Path, localFile, dlConf)
+            println(s"[$suffix]   Downloaded ${localFile.length()} bytes")
+          }
+          println(s"[$suffix] Stage 1: Done. Local input dir contents:")
+          Option(inputDir.listFiles()).getOrElse(Array.empty).foreach { f =>
+            println(s"[$suffix]   ${f.getName}  (${f.length()} bytes)")
+          }
+
+          // -- Stage 2: Run C++ mix --
+          println(s"[$suffix] Stage 2: Running FDNative.runMix(suffix=$suffix, thinningPct=$thinningPct)...")
+          val ret = FDNative.runMix(
+            configLines = configLines,
+            inputDir    = inputDir.getAbsolutePath,
+            outputDir   = outputDir.getAbsolutePath,
+            suffix      = suffix,
+            thinningPct = thinningPct
+          )
+          println(s"[$suffix] Stage 2: runMix returned: $ret")
+
+          if (ret != 0) {
+            System.err.println(s"[$suffix] ERROR: runMix returned non-zero exit code $ret")
+            (suffix, ret)
+          } else {
+            // -- Stage 3: Show output files --
+            val outFiles = Option(outputDir.listFiles())
+              .getOrElse(Array.empty)
+              .filter(_.isFile)
+
+            println(s"[$suffix] Stage 3: Output dir contains ${outFiles.length} file(s):")
+            outFiles.foreach { f =>
+              println(s"[$suffix]   ${f.getName}  (${f.length()} bytes)")
+              val lines = scala.io.Source.fromFile(f).getLines().take(10).toSeq
+              println(s"[$suffix]   --- first ${lines.size} lines ---")
+              lines.foreach(l => println(s"[$suffix]   $l"))
+              println(s"[$suffix]   ---")
+            }
+
+            // -- Stage 3b: Save intermediate files locally for inspection --
+            debugDirPath.foreach { dirPath =>
+              val debugBase = new java.io.File(s"$dirPath/$suffix")
+              val debugIn   = new java.io.File(debugBase, "input")
+              val debugOut  = new java.io.File(debugBase, "output")
+              debugIn.mkdirs()
+              debugOut.mkdirs()
+
+              Option(inputDir.listFiles()).getOrElse(Array.empty).foreach { src =>
+                val dst = new java.io.File(debugIn, src.getName)
+                java.nio.file.Files.copy(src.toPath, dst.toPath,
+                  java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+              }
+              outFiles.foreach { src =>
+                val dst = new java.io.File(debugOut, src.getName)
+                java.nio.file.Files.copy(src.toPath, dst.toPath,
+                  java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+              }
+              println(s"[$suffix] Stage 3b: Intermediate files saved to $debugBase")
+              println(s"[$suffix]   input/  : ${Option(debugIn.listFiles()).map(_.length).getOrElse(0)} file(s)")
+              println(s"[$suffix]   output/ : ${outFiles.length} file(s)")
+            }
+
+            // -- Stage 4: Upload output files to MIX_MAPRULE_ODIR --
+            println(s"[$suffix] Stage 4: Uploading ${outFiles.length} file(s) to s3://$bucket/$outputPfx/ (key index: $outKeyIdx)...")
+            val upConf = s3aConf(ak, sk, keys(outKeyIdx))
+            for (outFile <- outFiles) {
+              val s3Name = s"${outFile.getName}.key$outKeyIdx"
+              val dest   = s"s3a://$bucket/$outputPfx/$s3Name"
+              println(s"[$suffix]   Uploading ${outFile.getName} → $dest  (SSE-C key $outKeyIdx)")
+              uploadToS3(outFile, dest, upConf)
+              println(s"[$suffix]   Upload complete: s3://$bucket/$outputPfx/$s3Name")
+            }
+            println(s"[$suffix] Done ✓  Uploaded ${outFiles.length} file(s) to s3://$bucket/$outputPfx/")
+            (suffix, 0)
+          }
+        } finally {
+          def deleteRecursively(f: java.io.File): Unit = {
+            if (f.isDirectory) f.listFiles().foreach(deleteRecursively)
+            f.delete()
+          }
+          deleteRecursively(localBase)
+          println(s"[$suffix] Cleaned up temp dir ${localBase.getAbsolutePath}")
+        }
+      }
+      .collect()
+
+    val ok     = results.count(_._2 == 0)
+    val failed = results.filter(_._2 != 0)
+    println(s"\n=== Mix pipeline: $ok succeeded, ${failed.length} failed ===")
+    if (failed.nonEmpty) {
+      println("Failed configs:")
+      failed.foreach { case (suffix, code) => println(s"  $suffix (exit code $code)") }
+    }
+  }
+}
