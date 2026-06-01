@@ -342,7 +342,7 @@ object FDPipelineJob {
         val debugDirPath  = bcLocalDebugDir.value
         val thinningPct   = bcThinningPct.value
 
-        val taskId    = java.util.UUID.randomUUID().toString.take(8)
+        val taskId    = java.util.UUID.randomUUID().toString
         val localBase = new java.io.File(s"/tmp/fd_mix_$taskId")
         val inputDir  = new java.io.File(localBase, "input")
         val outputDir = new java.io.File(localBase, "output")

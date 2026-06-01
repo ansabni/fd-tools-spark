@@ -85,4 +85,126 @@ Java_com_fd_FDNative_runMix(
     return (jint)ret;
 }
 
+/*
+ * JNI bridge for unshard logic.
+ *
+ * Called from Scala as: FDNative.runUnshard(inputFile, outputFile, factor)
+ *
+ * Equivalent to running:  unshard <inputFile> <factor> <outputFile>
+ *
+ * Reads a stdtime file, applies the unshard factor, writes the result.
+ *
+ * Parameters:
+ *   jInputFile   - local path to the stdtime input file
+ *   jOutputFile  - local path to write the unsharded stdtime output
+ *   factor       - unshard factor (float, same as unshard's argv[2])
+ *
+ * Returns 0 on success, non-zero on failure.
+ */
+JNIEXPORT jint JNICALL
+Java_com_fd_FDNative_runUnshard(
+    JNIEnv  *env,
+    jobject  obj,
+    jstring  jInputFile,
+    jstring  jOutputFile,
+    jfloat   factor)
+{
+    const char *inputFile  = env->GetStringUTFChars(jInputFile,  0);
+    const char *outputFile = env->GetStringUTFChars(jOutputFile, 0);
+
+    int ret = 0;
+    try {
+        FD a;
+        a.stdtime.read((char*)inputFile);
+        a.stdtime.unshard(factor);
+        a.stdtime.write((char*)outputFile);
+    } catch (...) {
+        fprintf(stderr, "FD_JNI: runUnshard threw an exception\n");
+        ret = 1;
+    }
+
+    env->ReleaseStringUTFChars(jInputFile,  inputFile);
+    env->ReleaseStringUTFChars(jOutputFile, outputFile);
+
+    return (jint)ret;
+}
+
+/*
+ * JNI bridge for t2s (stdtime -> stdspace) logic.
+ *
+ * Called from Scala as: FDNative.runT2s(inputFile, outputFile)
+ *
+ * Equivalent to running:  t2s <inputFile> <outputFile>
+ *
+ * Reads a stdtime file, computes stdspace via createStdspaceStdcount(false),
+ * writes the resulting stdspace file.
+ *
+ * Returns 0 on success, non-zero on failure.
+ */
+JNIEXPORT jint JNICALL
+Java_com_fd_FDNative_runT2s(
+    JNIEnv  *env,
+    jobject  obj,
+    jstring  jInputFile,
+    jstring  jOutputFile)
+{
+    const char *inputFile  = env->GetStringUTFChars(jInputFile,  0);
+    const char *outputFile = env->GetStringUTFChars(jOutputFile, 0);
+
+    int ret = 0;
+    try {
+        FD a;
+        a.stdtime.read((char*)inputFile);
+        a.createStdspaceStdcount(false);
+        a.stdspace.write((char*)outputFile);
+    } catch (...) {
+        fprintf(stderr, "FD_JNI: runT2s threw an exception\n");
+        ret = 1;
+    }
+
+    env->ReleaseStringUTFChars(jInputFile,  inputFile);
+    env->ReleaseStringUTFChars(jOutputFile, outputFile);
+
+    return (jint)ret;
+}
+
+/*
+ * JNI bridge for t2c (stdtime -> stdcount) logic.
+ *
+ * Called from Scala as: FDNative.runT2c(inputFile, outputFile)
+ *
+ * Equivalent to running:  t2c <inputFile> <outputFile>
+ *
+ * Reads a stdtime file, computes stdcount via createStdspaceStdcount(false),
+ * writes the resulting stdcount file.
+ *
+ * Returns 0 on success, non-zero on failure.
+ */
+JNIEXPORT jint JNICALL
+Java_com_fd_FDNative_runT2c(
+    JNIEnv  *env,
+    jobject  obj,
+    jstring  jInputFile,
+    jstring  jOutputFile)
+{
+    const char *inputFile  = env->GetStringUTFChars(jInputFile,  0);
+    const char *outputFile = env->GetStringUTFChars(jOutputFile, 0);
+
+    int ret = 0;
+    try {
+        FD a;
+        a.stdtime.read((char*)inputFile);
+        a.createStdspaceStdcount(false);
+        a.stdcount.write((char*)outputFile);
+    } catch (...) {
+        fprintf(stderr, "FD_JNI: runT2c threw an exception\n");
+        ret = 1;
+    }
+
+    env->ReleaseStringUTFChars(jInputFile,  inputFile);
+    env->ReleaseStringUTFChars(jOutputFile, outputFile);
+
+    return (jint)ret;
+}
+
 } // extern "C"

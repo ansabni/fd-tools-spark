@@ -31,6 +31,46 @@ class FDNative {
   ): Int
 
   /**
+   * Runs the FD unshard logic natively (equivalent to running the unshard binary).
+   *
+   * Reads a stdtime file, applies the unshard factor, writes the result.
+   *
+   * @param inputFile   Local path to the stdtime input file
+   * @param outputFile  Local path to write the unsharded stdtime output
+   * @param factor      Unshard factor (float; same as unshard's 2nd argv)
+   * @return            0 on success, non-zero on failure
+   */
+  @native def runUnshard(
+    inputFile:  String,
+    outputFile: String,
+    factor:     Float
+  ): Int
+
+  /**
+   * Runs the FD t2s logic natively (stdtime → stdspace, equivalent to the t2s binary).
+   *
+   * @param inputFile   Local path to the stdtime input file
+   * @param outputFile  Local path to write the stdspace output
+   * @return            0 on success, non-zero on failure
+   */
+  @native def runT2s(
+    inputFile:  String,
+    outputFile: String
+  ): Int
+
+  /**
+   * Runs the FD t2c logic natively (stdtime → stdcount, equivalent to the t2c binary).
+   *
+   * @param inputFile   Local path to the stdtime input file
+   * @param outputFile  Local path to write the stdcount output
+   * @return            0 on success, non-zero on failure
+   */
+  @native def runT2c(
+    inputFile:  String,
+    outputFile: String
+  ): Int
+
+  /**
    * Allocates a C++ ReducerContext (splay tree + all accumulator state)
    * for one Spark partition. Returns an opaque Long handle that must be
    * passed to every subsequent reducerPushBatch / reducerFinalize call.

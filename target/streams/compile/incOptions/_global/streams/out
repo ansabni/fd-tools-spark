@@ -1,2 +1,20 @@
 [debug] Created transactional ClassFileManager with tempDir = /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes.bak
+[debug] About to delete class files:
+[debug] 	FDNative$.class
+[debug] 	FDNative.class
+[debug] We backup class files:
+[debug] 	FDNative$.class
+[debug] 	FDNative.class
+[debug] Registering generated classes:
+[debug] 	T2xJob.class
+[debug] 	T2sJob$.class
+[debug] 	T2xJob$T2cMode$.class
+[debug] 	FDNative$.class
+[debug] 	T2xJob$T2sMode$.class
+[debug] 	T2xJob$.class
+[debug] 	FDNative.class
+[debug] 	T2cJob.class
+[debug] 	T2xJob$Mode.class
+[debug] 	T2cJob$.class
+[debug] 	T2sJob.class
 [debug] Removing the temporary directory used for backing up class files: /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes.bak

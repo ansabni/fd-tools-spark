@@ -1,13 +1,22 @@
 # fd-tools-spark
 
-Spark implementation of the **FD mix pipeline** (`mix_maprule`).
+Spark implementation of the **FD tools** (`mix_maprule`, `unshard`, `t2s`, `t2c`).
 
 Reads `stdtime.*` footprint descriptor files from Linode Object Storage (S3),
-applies mix_maprule blending logic via C++ JNI, and uploads the resulting
-`stdtime.<suffix>` output file back to S3 — encrypted with SSE-C.
+runs the desired C++ tool via JNI, and uploads the resulting `stdtime.*` /
+`stdspace.*` / `stdcount.*` output file back to S3 — encrypted with SSE-C.
 
-This replaces the standalone `mix_maprule` binary for cloud/distributed
-execution while keeping all computation in the existing C++ codebase.
+Four Spark jobs are provided:
+
+| Job class | Launcher | Replaces |
+|---|---|---|
+| `com.fd.FDPipelineJob` | `run_pipeline_job.sh` | `mix_maprule` |
+| `com.fd.UnshardJob`    | `run_unshard_job.sh`  | `unshard` |
+| `com.fd.T2sJob`        | `run_t2s_job.sh`      | `t2s` (stdtime → stdspace) |
+| `com.fd.T2cJob`        | `run_t2c_job.sh`      | `t2c` (stdtime → stdcount) |
+
+This replaces the standalone binaries for cloud/distributed execution while
+keeping all computation in the existing C++ codebase.
 
 These `stdtime.*` input files are produced upstream by **fd-compute-spark**.
 
@@ -69,7 +78,9 @@ fd-tools-spark/
 │   ├── libFD.dylib            ← macOS — used for local testing
 │   └── libFD.so               ← Linux — used on Spark cluster
 └── src/main/scala/com/fd/
-    ├── FDPipelineJob.scala    ← Spark job
+    ├── FDPipelineJob.scala    ← Spark job — mix_maprule
+    ├── UnshardJob.scala       ← Spark job — unshard
+    ├── T2xJob.scala           ← Shared pipeline + T2sJob / T2cJob wrappers
     └── FDNative.scala         ← JNI interface declaration
 ```
 
@@ -156,6 +167,79 @@ S3_OUTPUT_KEY_INDEX=2 \
 FD_LOCAL_DEBUG_DIR=/tmp/fd_debug_out \
 ./run_pipeline_job.sh
 ```
+
+### Step 3b — Run the Unshard Job
+
+The unshard job divides every value in a `stdtime.*` file by an integer
+`UNSHARD_FACTOR` (typically the number of map shards that produced it). It
+operates on a single input file rather than a directory.
+
+```bash
+cd fd-tools-spark
+
+UNSHARD_IDIR=Anirudh/mix_output/stdtime.config.key2 \
+UNSHARD_ODIR=Anirudh/unshard_output/stdtime.unshard \
+UNSHARD_FACTOR=16 \
+./run_unshard_job.sh
+```
+
+| Variable | Required | Description |
+|---|---|---|
+| `UNSHARD_IDIR` | ✅ | S3 path to the **single** input `stdtime.*.keyN` file |
+| `UNSHARD_ODIR` | ✅ | S3 output path (without `.keyN` — added automatically) |
+| `UNSHARD_FACTOR` | ✅ | Float divisor applied to every value in the input |
+| `S3_OUTPUT_KEY_INDEX` | ✗ | SSE-C key index for the output file. Defaults to smallest key index |
+| `FD_LOCAL_DEBUG_DIR` | ✗ | If set, also writes a local copy of the unsharded output |
+
+Output is uploaded to `s3://<S3_BUCKET>/<UNSHARD_ODIR>.key<N>`.
+
+---
+
+### Step 3c — Run the t2s Job (stdtime → stdspace)
+
+The t2s job converts a `stdtime.*` file into a `stdspace.*` sizing curve.
+It operates on a single input file rather than a directory.
+
+```bash
+cd fd-tools-spark
+
+T2S_IDIR=Anirudh/unshard_output/stdtime.unshard.key2 \
+T2S_ODIR=Anirudh/t2s_output/stdspace.unshard \
+./run_t2s_job.sh
+```
+
+| Variable | Required | Description |
+|---|---|---|
+| `T2S_IDIR` | ✅ | S3 path to the **single** input `stdtime.*.keyN` file |
+| `T2S_ODIR` | ✅ | S3 output path (without `.keyN` — added automatically) |
+| `S3_OUTPUT_KEY_INDEX` | ✗ | SSE-C key index for the output file. Defaults to smallest key index |
+| `FD_LOCAL_DEBUG_DIR` | ✗ | If set, also writes a local copy of the stdspace output |
+
+Output is uploaded to `s3://<S3_BUCKET>/<T2S_ODIR>.key<N>`.
+
+---
+
+### Step 3d — Run the t2c Job (stdtime → stdcount)
+
+The t2c job converts a `stdtime.*` file into a `stdcount.*` sizing curve.
+Same shape as t2s — only the output type differs.
+
+```bash
+cd fd-tools-spark
+
+T2C_IDIR=Anirudh/unshard_output/stdtime.unshard.key2 \
+T2C_ODIR=Anirudh/t2c_output/stdcount.unshard \
+./run_t2c_job.sh
+```
+
+| Variable | Required | Description |
+|---|---|---|
+| `T2C_IDIR` | ✅ | S3 path to the **single** input `stdtime.*.keyN` file |
+| `T2C_ODIR` | ✅ | S3 output path (without `.keyN` — added automatically) |
+| `S3_OUTPUT_KEY_INDEX` | ✗ | SSE-C key index for the output file. Defaults to smallest key index |
+| `FD_LOCAL_DEBUG_DIR` | ✗ | If set, also writes a local copy of the stdcount output |
+
+Output is uploaded to `s3://<S3_BUCKET>/<T2C_ODIR>.key<N>`.
 
 ---
 
@@ -286,6 +370,5 @@ MIX_MAPRULE_SUFFIX=config \
 
 | Item | Notes |
 |---|---|
-| Single Spark task | One mix per job invocation. Run the job multiple times (with different `MIX_MAPRULE_*` vars) for multiple mixes in parallel. |
-| `t2s` / `t2c` not yet in Spark | JNI wrappers for these tools follow the same pattern as `FD_JNI.cpp` and can be added to `FDNative.scala` |
-| `concat` / `unshard` not yet in Spark | Same — the C++ sources are included for reference |
+| Single Spark task | One operation per job invocation. Run the job multiple times (with different env vars) for multiple operations in parallel. |
+| `concat` not yet in Spark | The C++ source is included for reference; a JNI wrapper would follow the same pattern as `runT2s` / `runT2c` in `FD_JNI.cpp`. |

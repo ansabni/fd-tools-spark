@@ -1,1 +1,1 @@
-["com.fd.FDPipelineJob"]
+["com.fd.FDPipelineJob","com.fd.T2cJob","com.fd.T2sJob","com.fd.UnshardJob"]

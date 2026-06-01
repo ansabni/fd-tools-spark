@@ -1,1 +1,37 @@
-[debug] Jar uptodate: /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/fd-spark_2.13-0.1.jar
+[debug] Packaging /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/fd-spark_2.13-0.1.jar ...
+[debug] Input file mappings:
+[debug] 	com
+[debug] 	  /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes/com
+[debug] 	com/fd
+[debug] 	  /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes/com/fd
+[debug] 	com/fd/T2cJob.class
+[debug] 	  /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes/com/fd/T2cJob.class
+[debug] 	com/fd/T2xJob$Mode.class
+[debug] 	  /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes/com/fd/T2xJob$Mode.class
+[debug] 	com/fd/T2cJob$.class
+[debug] 	  /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes/com/fd/T2cJob$.class
+[debug] 	com/fd/UnshardJob$.class
+[debug] 	  /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes/com/fd/UnshardJob$.class
+[debug] 	com/fd/FDNative$.class
+[debug] 	  /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes/com/fd/FDNative$.class
+[debug] 	com/fd/FDPipelineJob$.class
+[debug] 	  /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes/com/fd/FDPipelineJob$.class
+[debug] 	com/fd/T2xJob$T2cMode$.class
+[debug] 	  /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes/com/fd/T2xJob$T2cMode$.class
+[debug] 	com/fd/FDPipelineJob.class
+[debug] 	  /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes/com/fd/FDPipelineJob.class
+[debug] 	com/fd/T2xJob$T2sMode$.class
+[debug] 	  /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes/com/fd/T2xJob$T2sMode$.class
+[debug] 	com/fd/UnshardJob.class
+[debug] 	  /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes/com/fd/UnshardJob.class
+[debug] 	com/fd/FDNative.class
+[debug] 	  /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes/com/fd/FDNative.class
+[debug] 	com/fd/T2sJob$.class
+[debug] 	  /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes/com/fd/T2sJob$.class
+[debug] 	com/fd/T2sJob.class
+[debug] 	  /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes/com/fd/T2sJob.class
+[debug] 	com/fd/T2xJob.class
+[debug] 	  /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes/com/fd/T2xJob.class
+[debug] 	com/fd/T2xJob$.class
+[debug] 	  /Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes/com/fd/T2xJob$.class
+[debug] Done packaging.
