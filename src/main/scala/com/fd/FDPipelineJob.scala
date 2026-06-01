@@ -350,7 +350,7 @@ object FDPipelineJob {
         outputDir.mkdirs()
 
         println(s"[$suffix] ── Starting mix task ──────────────────────────")
-        println(s"[$suffix] Task thread id   : $taskId")
+        println(s"[$suffix] Task id          : $taskId")
         println(s"[$suffix] Input files      : ${inputFiles.size}")
         println(s"[$suffix] Local input dir  : ${inputDir.getAbsolutePath}")
         println(s"[$suffix] Local output dir : ${outputDir.getAbsolutePath}")
