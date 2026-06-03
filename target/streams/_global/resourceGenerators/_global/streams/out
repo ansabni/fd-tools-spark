@@ -1,0 +1,2 @@
+[info] [native] bundling (via symlink) /Users/ansabni/Work/MoveToSpark/fd-tools-spark/lib/libFD.dylib → resource native/libFD.so
+[info] [native] bundling /Users/ansabni/Work/MoveToSpark/fd-tools-spark/lib/libFD.dylib → resource native/libFD.dylib

@@ -104,8 +104,49 @@ class FDNative {
 }
 
 object FDNative extends FDNative {
-  // Load libFD.dylib (macOS) / libFD.so (Linux) from java.library.path.
-  // Local dev:   -Djava.library.path=<project>/lib   (set in build.sbt)
-  // spark-submit: --files lib/libFD.so + -Djava.library.path=.
-  System.loadLibrary("FD")
+  // ---------------------------------------------------------------------------
+  // Native library loading.
+  //
+  // Resolution order:
+  //   1. Bundled jar resource   /native/libFD.{so,dylib}    ← preferred
+  //   2. java.library.path / LD_LIBRARY_PATH (System.loadLibrary)  ← fallback
+  //
+  // The build.sbt resourceGenerators task copies lib/libFD.{so,dylib} into the
+  // packaged jar under "native/" so the receiving team only needs the jar.
+  // ---------------------------------------------------------------------------
+  private def platformLibName(): String = {
+    val os = System.getProperty("os.name", "").toLowerCase
+    if (os.contains("mac") || os.contains("darwin")) "libFD.dylib"
+    else                                             "libFD.so"
+  }
+
+  private def loadFromJar(): Boolean = {
+    val name         = platformLibName()
+    val resourcePath = s"/native/$name"
+    val in           = getClass.getResourceAsStream(resourcePath)
+    if (in == null) {
+      System.err.println(s"[FDNative] no $resourcePath in jar — falling back to java.library.path")
+      return false
+    }
+    try {
+      val dotIdx = name.lastIndexOf('.')
+      val (prefix, suffix) =
+        if (dotIdx > 0) (name.substring(0, dotIdx), name.substring(dotIdx))
+        else            (name, "")
+      val tmp = java.io.File.createTempFile(prefix, suffix)
+      tmp.deleteOnExit()
+      java.nio.file.Files.copy(
+        in, tmp.toPath,
+        java.nio.file.StandardCopyOption.REPLACE_EXISTING
+      )
+      System.load(tmp.getAbsolutePath)
+      System.err.println(s"[FDNative] Extracted $name → ${tmp.getAbsolutePath}")
+      System.err.println(s"[FDNative] Loaded native library successfully ✓")
+      true
+    } finally in.close()
+  }
+
+  if (!loadFromJar()) {
+    System.loadLibrary("FD")
+  }
 }

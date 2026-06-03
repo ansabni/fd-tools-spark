@@ -1,2 +1,3 @@
 [debug] Copy resource mappings: 
-[debug] 	
+[debug] 	(/Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/resource_managed/main/native/libFD.so,/Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes/native/libFD.so)
+[debug] 	(/Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/resource_managed/main/native/libFD.dylib,/Users/ansabni/Work/MoveToSpark/fd-tools-spark/target/scala-2.13/classes/native/libFD.dylib)

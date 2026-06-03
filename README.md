@@ -77,11 +77,13 @@ fd-tools-spark/
 ├── lib/                       ← Native library (output of compile_native.sh)
 │   ├── libFD.dylib            ← macOS — used for local testing
 │   └── libFD.so               ← Linux — used on Spark cluster
+│                              (sbt package bundles these into the jar
+│                               under  native/  for runtime extraction)
 └── src/main/scala/com/fd/
     ├── FDPipelineJob.scala    ← Spark job — mix_maprule
     ├── UnshardJob.scala       ← Spark job — unshard
     ├── T2xJob.scala           ← Shared pipeline + T2sJob / T2cJob wrappers
-    └── FDNative.scala         ← JNI interface declaration
+    └── FDNative.scala         ← JNI interface + jar-resource loader
 ```
 
 ---
@@ -90,14 +92,19 @@ fd-tools-spark/
 
 | File | Portable? | Notes |
 |---|---|---|
-| `target/scala-2.13/fd-spark_2.13-0.1.jar` | ✅ Any JVM | Pure Scala bytecode |
-| `lib/libFD.so` | ❌ Platform-specific | Must be **recompiled** on target Linux |
-| `lib/libFD.dylib` | ❌ macOS arm64 only | For local Mac testing only |
-| `run_pipeline_job.sh` | ✅ | Shell script, no changes needed |
+| `target/scala-2.13/fd-spark_2.13-0.1.jar` | ⚠️ Bundles native lib for **the platform it was packaged on** | Pure Scala bytecode + the `.so`/`.dylib` produced by `compile_native.sh`, embedded as resources under `native/` |
+| `run_pipeline_job.sh` / `run_unshard_job.sh` / `run_t2s_job.sh` / `run_t2c_job.sh` | ✅ | Shell scripts, no changes needed |
 | `conf/encryption_keys.json` | ✅ | Keep secret — contains AES keys |
 
-**The `.so` / `.dylib` MUST be compiled on the machine/OS where Spark will run.**
-A macOS `.dylib` will not load on a Linux cluster.
+> **The native library is bundled inside the jar.**
+> At runtime, `FDNative` extracts `native/libFD.{so,dylib}` from the jar to a
+> temp file and calls `System.load()`. No `LD_LIBRARY_PATH` / `java.library.path`
+> setup needed on the receiving cluster.
+>
+> ⚠️ The jar is platform-specific because the bundled `.so`/`.dylib` is.
+> Re-run `./compile_native.sh && sbt package` on the target OS/arch (typically
+> Linux x86_64) before distributing to the cluster. A macOS-built jar will
+> fail with `dlopen` errors on Linux.
 
 ---
 
@@ -113,8 +120,8 @@ cd fd-tools-spark
 ```
 
 This produces:
-- `lib/libFD.dylib` (macOS) or `lib/libFD.so` (Linux) — loaded by Spark via JNI
-- Standalone binaries in `cpp_src/`: `mix_maprule`, `t2s`, `t2c`, `concat`, `unshard`
+- `lib/libFD.dylib` (macOS) or `lib/libFD.so` (Linux) — embedded into the jar by step 2
+- Standalone binaries in `cpp_src/`: `mix_maprule`, `t2s`, `t2c`, `concat`, `unshard` (for local CLI testing)
 
 **Linux prerequisites:**
 ```bash
@@ -138,7 +145,19 @@ sbt package
 # → target/scala-2.13/fd-spark_2.13-0.1.jar
 ```
 
-The jar is pre-built and included if distributed. Only rebuild if you modify Scala code.
+`sbt package` automatically copies whichever of `lib/libFD.{so,dylib}` exist
+into the jar under `native/`. You can verify with:
+
+```bash
+unzip -l target/scala-2.13/fd-spark_2.13-0.1.jar | grep native/
+#   native/libFD.so      ...
+#   native/libFD.dylib   ...   (only on macOS dev boxes)
+```
+
+> Always run `compile_native.sh` first. If `lib/` is empty when `sbt package`
+> runs, the resulting jar will not contain a native lib and the runtime loader
+> will fall back to `System.loadLibrary("FD")` (which most deploys won't have
+> set up via `LD_LIBRARY_PATH`).
 
 ---
 
