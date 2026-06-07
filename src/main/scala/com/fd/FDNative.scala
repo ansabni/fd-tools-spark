@@ -143,6 +143,10 @@ object FDNative extends FDNative {
       System.err.println(s"[FDNative] Extracted $name → ${tmp.getAbsolutePath}")
       System.err.println(s"[FDNative] Loaded native library successfully ✓")
       true
+    } catch {
+      case _: UnsatisfiedLinkError =>
+        System.err.println(s"[FDNative] Bundled $name is not compatible with this platform — falling back to java.library.path")
+        false
     } finally in.close()
   }
 

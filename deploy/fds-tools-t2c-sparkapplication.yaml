@@ -1,0 +1,140 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# FDS Tools — T2cJob (stdtime → stdcount)
+#
+# Downloads one stdtime file from S3, applies C++ t2c logic via JNI,
+# and uploads the resulting stdcount file back to S3.
+#
+# Equivalent to: t2c <input> <output>
+#
+# Do NOT apply this file directly — use deploy/run-t2c.sh which
+# substitutes all <PLACEHOLDER> values first.
+# ─────────────────────────────────────────────────────────────────────────────
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fds-tools-creds
+  namespace: spark-operator
+stringData:
+  access-key: "<S3_ACCESS_KEY>"
+  secret-key: "<S3_SECRET_KEY>"
+
+---
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fds-tools-enc-keys
+  namespace: spark-operator
+stringData:
+  encryption-keys.json: '$ENCRYPTION_KEYS_JSON'
+
+---
+
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: fds-tools-t2c
+  namespace: spark-operator
+
+spec:
+  type: Scala
+  mode: cluster
+  image: "apache/spark:4.0.0-scala2.13-java17-ubuntu"
+  imagePullPolicy: IfNotPresent
+
+  mainClass: com.fd.T2cJob
+  mainApplicationFile: "https://fds-jar.in-maa-1.linodeobjects.com/fd_tools_jar/fd-spark_2.13-0.1.jar"
+  sparkVersion: "4.0.0"
+
+  restartPolicy:
+    type: Never
+
+  deps:
+    jars:
+      - "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar"
+      - "https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar"
+
+  hadoopConf:
+    "fs.s3a.impl":                "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    "fs.s3a.path.style.access":   "true"
+    "fs.s3a.signing-algorithm":   "S3SignerType"
+    "fs.s3a.checksum.validation": "false"
+    "fs.s3a.connection.ssl.enabled": "true"
+    "fs.s3a.endpoint":            "us-ord-10.linodeobjects.com"
+
+  sparkConf:
+    "spark.serializer":                 "org.apache.spark.serializer.KryoSerializer"
+    "spark.network.timeout":            "800s"
+    "spark.executor.heartbeatInterval": "60s"
+    "spark.kryoserializer.buffer.max":  "512m"
+    "spark.jars.ivy":                   "/tmp/.ivy2"
+    "spark.driver.extraJavaOptions":    "-Duser.home=/tmp -Djava.library.path=. --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED"
+    "spark.executor.extraJavaOptions":  "-Duser.home=/tmp -Djava.library.path=. --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED"
+
+    "spark.kubernetes.driver.secretKeyRef.S3_ACCESS_KEY":   "fds-tools-creds:access-key"
+    "spark.kubernetes.driver.secretKeyRef.S3_SECRET_KEY":   "fds-tools-creds:secret-key"
+    "spark.kubernetes.executor.secretKeyRef.S3_ACCESS_KEY": "fds-tools-creds:access-key"
+    "spark.kubernetes.executor.secretKeyRef.S3_SECRET_KEY": "fds-tools-creds:secret-key"
+
+    # ── T2C_* env vars ────────────────────────────────────────────────────────
+    # T2C_IDIR / T2C_ODIR are FILE paths (not directory prefixes).
+    "spark.kubernetes.driverEnv.T2C_IDIR":           "<T2C_IDIR>"
+    "spark.kubernetes.driverEnv.T2C_ODIR":           "<T2C_ODIR>"
+    "spark.executorEnv.T2C_IDIR":                    "<T2C_IDIR>"
+    "spark.executorEnv.T2C_ODIR":                    "<T2C_ODIR>"
+
+    "spark.kubernetes.executor.deleteOnTermination": "false"
+
+  arguments:
+    - "<S3_BUCKET>"
+    - "/mnt/encryption-keys/encryption-keys.json"
+
+  driver:
+    cores: 1
+    memory: "2g"
+    serviceAccount: spark
+    labels:
+      app: fds-tools
+      component: driver
+    env:
+      - name: AWS_REQUEST_CHECKSUM_CALCULATION
+        value: "when_required"
+      - name: S3_ENDPOINT
+        value: "us-ord-10.linodeobjects.com"
+    secrets:
+      - name: fds-tools-enc-keys
+        path: /mnt/encryption-keys
+        secretType: Generic
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+          - ALL
+      runAsNonRoot: true
+      runAsUser: 185
+
+  executor:
+    cores: 2
+    instances: 1
+    memory: "4g"
+    memoryOverhead: "1g"
+    labels:
+      app: fds-tools
+      component: executor
+    env:
+      - name: AWS_REQUEST_CHECKSUM_CALCULATION
+        value: "when_required"
+      - name: S3_ENDPOINT
+        value: "us-ord-10.linodeobjects.com"
+    secrets:
+      - name: fds-tools-enc-keys
+        path: /mnt/encryption-keys
+        secretType: Generic
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+          - ALL
+      runAsNonRoot: true
+      runAsUser: 185

@@ -167,6 +167,26 @@ object FDPipelineJob {
   // Main
   // -------------------------------------------------------------------------
 
+  /**
+   * fdcompute-spark writes sharded stdtime files with N header lines followed by
+   * N copies of each data row (one per shard). The C++ read loop errors on the
+   * second # line, silently skipping every file and producing empty output.
+   *
+   * Fix: rewrite the file keeping only the first # line (the aggregate header)
+   * and all non-# lines. The C++ accumulates data rows with +=, so N copies of
+   * each row sum correctly to the aggregate totals stated in the first header.
+   */
+  def normalizeStdtimeHeaders(f: java.io.File, logPrefix: String): Unit = {
+    val lines  = scala.io.Source.fromFile(f).getLines().toList
+    val hdrIdx = lines.lastIndexWhere(_.startsWith("#"))
+    if (hdrIdx <= 0) return  // 0 or 1 header — nothing to fix
+    val header   = lines.head
+    val dataLines = lines.filterNot(_.startsWith("#"))
+    val out = new java.io.PrintWriter(f)
+    try { (header +: dataLines).foreach(out.println) } finally out.close()
+    println(s"[$logPrefix]   Normalized ${f.getName}: stripped $hdrIdx extra header line(s)")
+  }
+
   def main(args: Array[String]): Unit = {
     if (args.length < 2) {
       System.err.println(
@@ -294,7 +314,7 @@ object FDPipelineJob {
     // Key index for output encryption
     // ------------------------------------------------------------------
     val outKeyIdx = sys.env.get("S3_OUTPUT_KEY_INDEX").filter(_.nonEmpty)
-      .getOrElse(encryptionKeys.keys.toSeq.sorted.head)
+      .getOrElse(encryptionKeys.keys.toSeq.sorted.last)
     println(s"[DEBUG] Output encryption key index: $outKeyIdx  (S3_OUTPUT_KEY_INDEX)")
 
     // ------------------------------------------------------------------
@@ -370,6 +390,9 @@ object FDPipelineJob {
             val dlConf = s3aConf(ak, sk, keys(keyIdx))
             downloadS3File(s3Path, localFile, dlConf)
             println(s"[$suffix]   Downloaded ${localFile.length()} bytes")
+            // fdcompute writes multi-shard files: N header lines then N repetitions of each
+            // data row. The C++ reader only handles one # header; strip extras so it works.
+            normalizeStdtimeHeaders(localFile, suffix)
           }
           println(s"[$suffix] Stage 1: Done. Local input dir contents:")
           Option(inputDir.listFiles()).getOrElse(Array.empty).foreach { f =>

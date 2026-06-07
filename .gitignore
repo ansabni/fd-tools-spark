@@ -1,0 +1,31 @@
+# Build output
+target/
+project/target/
+project/project/target/
+
+# Local deploy scripts with real credentials — NEVER commit
+deploy/run-pipeline.local.sh
+deploy/run-unshard.local.sh
+deploy/run-t2s.local.sh
+deploy/run-t2c.local.sh
+
+# SBT
+.bsp/
+.metals/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# macOS
+.DS_Store
+
+# Kubernetes cluster credentials — NEVER commit
+kubeconfig.yaml
+
+# Logs
+*.log
+
+# Local JARs
+*.jar
