@@ -198,7 +198,7 @@ object T2xJob {
 
     val inputKeyIdx = keyIndexFromPath(inputKey)
     val outKeyIdx   = sys.env.get("S3_OUTPUT_KEY_INDEX").filter(_.nonEmpty)
-      .getOrElse(encryptionKeys.keys.toSeq.sorted.head)
+      .getOrElse(encryptionKeys.keys.toSeq.sorted.last)
 
     println(s"[DEBUG] ${mode.idirEnv}    : s3://$s3Bucket/$inputKey  (input key index: $inputKeyIdx)")
     println(s"[DEBUG] ${mode.odirEnv}    : s3://$s3Bucket/$outputKey")

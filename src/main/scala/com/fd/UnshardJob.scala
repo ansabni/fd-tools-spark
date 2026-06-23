@@ -185,7 +185,7 @@ object UnshardJob {
 
     val inputKeyIdx = keyIndexFromPath(inputKey)
     val outKeyIdx   = sys.env.get("S3_OUTPUT_KEY_INDEX").filter(_.nonEmpty)
-      .getOrElse(encryptionKeys.keys.toSeq.sorted.head)
+      .getOrElse(encryptionKeys.keys.toSeq.sorted.last)
 
     println(s"[DEBUG] UNSHARD_IDIR    : s3://$s3Bucket/$inputKey  (input key index: $inputKeyIdx)")
     println(s"[DEBUG] UNSHARD_ODIR    : s3://$s3Bucket/$outputKey")

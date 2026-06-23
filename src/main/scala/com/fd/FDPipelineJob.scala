@@ -113,7 +113,7 @@ object FDPipelineJob {
    */
   def listS3Files(bucket: String, prefix: String, conf: Configuration): Seq[String] = {
     val basePath = new Path(s"s3a://$bucket/$prefix")
-    val fs       = FileSystem.get(basePath.toUri, conf)
+    val fs       = FileSystem.newInstance(basePath.toUri, conf)
     val buf      = mutable.ArrayBuffer[String]()
     try {
       val iter = fs.listFiles(basePath, /*recursive=*/ true)
@@ -130,7 +130,7 @@ object FDPipelineJob {
    */
   def downloadS3File(s3Path: String, localPath: java.io.File, conf: Configuration): Unit = {
     val path   = new Path(s3Path)
-    val fs     = FileSystem.get(path.toUri, conf)
+    val fs     = FileSystem.newInstance(path.toUri, conf)
     val in     = fs.open(path)
     val out    = new java.io.FileOutputStream(localPath)
     try {
@@ -149,7 +149,7 @@ object FDPipelineJob {
    */
   def uploadToS3(localFile: java.io.File, s3Path: String, conf: Configuration): Unit = {
     val path   = new Path(s3Path)
-    val fs     = FileSystem.get(path.toUri, conf)
+    val fs     = FileSystem.newInstance(path.toUri, conf)
     val out    = fs.create(path, /*overwrite=*/ true)
     val in     = new java.io.FileInputStream(localFile)
     try {
@@ -166,6 +166,26 @@ object FDPipelineJob {
   // -------------------------------------------------------------------------
   // Main
   // -------------------------------------------------------------------------
+
+  /**
+   * fdcompute-spark writes sharded stdtime files with N header lines followed by
+   * N copies of each data row (one per shard). The C++ read loop errors on the
+   * second # line, silently skipping every file and producing empty output.
+   *
+   * Fix: rewrite the file keeping only the first # line (the aggregate header)
+   * and all non-# lines. The C++ accumulates data rows with +=, so N copies of
+   * each row sum correctly to the aggregate totals stated in the first header.
+   */
+  def normalizeStdtimeHeaders(f: java.io.File, logPrefix: String): Unit = {
+    val lines  = scala.io.Source.fromFile(f).getLines().toList
+    val hdrIdx = lines.lastIndexWhere(_.startsWith("#"))
+    if (hdrIdx <= 0) return  // 0 or 1 header — nothing to fix
+    val header   = lines.head
+    val dataLines = lines.filterNot(_.startsWith("#"))
+    val out = new java.io.PrintWriter(f)
+    try { (header +: dataLines).foreach(out.println) } finally out.close()
+    println(s"[$logPrefix]   Normalized ${f.getName}: stripped $hdrIdx extra header line(s)")
+  }
 
   def main(args: Array[String]): Unit = {
     if (args.length < 2) {
@@ -261,40 +281,83 @@ object FDPipelineJob {
     }
 
     // ------------------------------------------------------------------
-    // Download config from S3 (MIX_MAPRULE_CONFIG)
+    // Resolve config files from S3.
+    // MIX_MAPRULE_CONFIG may be:
+    //   - a single S3 key:   "fd_tools_config/g27.mg1.key2"
+    //   - a glob pattern:    "fd_tools_config/g*.mg1.key2"
+    //                        "fd_tools_config/g*.mg1*"
+    // Glob: list S3, filter by pattern, download each — one task per config.
+    // Single: existing behaviour; MIX_MAPRULE_SUFFIX is honoured.
     // ------------------------------------------------------------------
-    val cfgFileName  = mixCfgKey.split("/").last    // e.g. "config.key2"
-    val cfgKeyIdx    = keyIndexFromPath(cfgFileName)
-    val cfgLocalName = stripKeyN(cfgFileName)       // e.g. "config"
-
-    // Suffix: MIX_MAPRULE_SUFFIX if set, else derive from config filename
-    val suffix = sys.env.get("MIX_MAPRULE_SUFFIX").filter(_.nonEmpty)
-      .getOrElse(cfgLocalName.stripSuffix(".config"))
-
-    println(s"[DEBUG] Downloading config from S3: s3://$s3Bucket/$mixCfgKey  (key index: $cfgKeyIdx)")
-    val tmpCfg = java.io.File.createTempFile("fd_config_", ".tmp")
-    val configLines: String = try {
-      val cfgConf = s3aConf(accessKey, secretKey, encryptionKeys(cfgKeyIdx))
-      downloadS3File(s"s3a://$s3Bucket/$mixCfgKey", tmpCfg, cfgConf)
-      val lines = scala.io.Source.fromFile(tmpCfg).mkString
-      println(s"[DEBUG] Config file contents (${lines.linesIterator.size} lines):")
-      lines.linesIterator.foreach(l => println(s"[DEBUG]   $l"))
-      lines
-    } finally {
-      tmpCfg.delete()
+    def globToRegex(glob: String): java.util.regex.Pattern = {
+      val sb = new StringBuilder("^")
+      glob.foreach {
+        case '*' => sb.append("[^/]*")
+        case '.' => sb.append("\\.")
+        case c   => sb.append(java.util.regex.Pattern.quote(c.toString))
+      }
+      sb.append("$")
+      java.util.regex.Pattern.compile(sb.toString)
     }
 
-    println(s"[DEBUG] Output suffix         : '$suffix'  →  output file: stdtime.$suffix")
-    println(s"[DEBUG] MIX_MAPRULE_IDIR      : s3://$s3Bucket/$mixIdir")
-    println(s"[DEBUG] MIX_MAPRULE_ODIR      : s3://$s3Bucket/$mixOdir")
-    println(s"[DEBUG] MIX_MAPRULE_CONFIG    : s3://$s3Bucket/$mixCfgKey")
-    println(s"[DEBUG] Thinning pct          : $thinningPct")
+    val configItems: Seq[(String, String)] = if (mixCfgKey.contains("*")) {
+      val prefixUpToStar = mixCfgKey.substring(0, mixCfgKey.indexOf('*'))
+      // S3A needs a real directory path — strip back to the last slash
+      val listPrefix = prefixUpToStar.substring(0, prefixUpToStar.lastIndexOf('/') + 1)
+      val regex      = globToRegex(mixCfgKey)
+      println(s"[DEBUG] MIX_MAPRULE_CONFIG is a glob: $mixCfgKey")
+      println(s"[DEBUG] Scanning S3 under: s3://$s3Bucket/$listPrefix")
+      val matched = listS3Files(s3Bucket, listPrefix, listConf)
+        .map(_.stripPrefix(s"s3a://$s3Bucket/"))
+        .filter(k => regex.matcher(k).matches())
+        .sorted
+      println(s"[DEBUG] Matched ${matched.size} config file(s):")
+      matched.foreach(k => println(s"[DEBUG]   $k"))
+      matched.map { key =>
+        val fileName  = key.split("/").last
+        val keyIdx    = keyIndexFromPath(fileName)
+        val localName = stripKeyN(fileName)
+        val cfgSuffix = localName
+        val tmp = java.io.File.createTempFile("fd_cfg_", ".tmp")
+        val lines = try {
+          downloadS3File(s"s3a://$s3Bucket/$key", tmp,
+            s3aConf(accessKey, secretKey, encryptionKeys(keyIdx)))
+          scala.io.Source.fromFile(tmp).mkString
+        } finally tmp.delete()
+        println(s"[DEBUG]   → suffix='$cfgSuffix'  (${lines.linesIterator.size} config lines)")
+        (cfgSuffix, lines)
+      }
+    } else {
+      val cfgFileName  = mixCfgKey.split("/").last
+      val cfgKeyIdx    = keyIndexFromPath(cfgFileName)
+      val cfgLocalName = stripKeyN(cfgFileName)
+      val cfgSuffix = sys.env.get("MIX_MAPRULE_SUFFIX").filter(_.nonEmpty)
+        .getOrElse(cfgLocalName.stripSuffix(".config"))
+      println(s"[DEBUG] Downloading config from S3: s3://$s3Bucket/$mixCfgKey  (key index: $cfgKeyIdx)")
+      val tmp = java.io.File.createTempFile("fd_config_", ".tmp")
+      val lines: String = try {
+        downloadS3File(s"s3a://$s3Bucket/$mixCfgKey", tmp,
+          s3aConf(accessKey, secretKey, encryptionKeys(cfgKeyIdx)))
+        val l = scala.io.Source.fromFile(tmp).mkString
+        println(s"[DEBUG] Config file contents (${l.linesIterator.size} lines):")
+        l.linesIterator.foreach(ln => println(s"[DEBUG]   $ln"))
+        l
+      } finally tmp.delete()
+      println(s"[DEBUG] Output suffix: '$cfgSuffix'  →  stdtime.$cfgSuffix")
+      Seq((cfgSuffix, lines))
+    }
+
+    println(s"[DEBUG] Configs to process  : ${configItems.size}")
+    println(s"[DEBUG] MIX_MAPRULE_IDIR   : s3://$s3Bucket/$mixIdir")
+    println(s"[DEBUG] MIX_MAPRULE_ODIR   : s3://$s3Bucket/$mixOdir")
+    println(s"[DEBUG] MIX_MAPRULE_CONFIG : s3://$s3Bucket/$mixCfgKey")
+    println(s"[DEBUG] Thinning pct       : $thinningPct")
 
     // ------------------------------------------------------------------
     // Key index for output encryption
     // ------------------------------------------------------------------
     val outKeyIdx = sys.env.get("S3_OUTPUT_KEY_INDEX").filter(_.nonEmpty)
-      .getOrElse(encryptionKeys.keys.toSeq.sorted.head)
+      .getOrElse(encryptionKeys.keys.toSeq.sorted.last)
     println(s"[DEBUG] Output encryption key index: $outKeyIdx  (S3_OUTPUT_KEY_INDEX)")
 
     // ------------------------------------------------------------------
@@ -322,14 +385,15 @@ object FDPipelineJob {
     val bcThinningPct    = sc.broadcast(thinningPct)
 
     // ------------------------------------------------------------------
-    // MAP phase: single Spark task
+    // MAP phase: one Spark task per config file.
     //   1. Download all stdtime.* input files from S3
     //   2. Run C++ mix (FDNative.runMix)
     //   3. (optional) Copy to FD_LOCAL_DEBUG_DIR
     //   4. Upload output to MIX_MAPRULE_ODIR encrypted with S3_OUTPUT_KEY_INDEX
     //   5. Clean up temp dirs
+    // configItems has one entry per resolved config (1 for single, N for glob).
     // ------------------------------------------------------------------
-    val results: Array[(String, Int)] = sc.parallelize(Seq((suffix, configLines)), 1)
+    val results: Array[(String, Int)] = sc.parallelize(configItems, configItems.size.max(1))
       .map { case (suffix, configLines) =>
 
         val ak            = bcAccessKey.value
@@ -370,6 +434,9 @@ object FDPipelineJob {
             val dlConf = s3aConf(ak, sk, keys(keyIdx))
             downloadS3File(s3Path, localFile, dlConf)
             println(s"[$suffix]   Downloaded ${localFile.length()} bytes")
+            // fdcompute writes multi-shard files: N header lines then N repetitions of each
+            // data row. The C++ reader only handles one # header; strip extras so it works.
+            normalizeStdtimeHeaders(localFile, suffix)
           }
           println(s"[$suffix] Stage 1: Done. Local input dir contents:")
           Option(inputDir.listFiles()).getOrElse(Array.empty).foreach { f =>
