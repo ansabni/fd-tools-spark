@@ -18,18 +18,27 @@ import scala.io.Source
  * applies mix_maprule logic (via C++ JNI), and uploads the resulting
  * stdtime.* output file back to S3.
  *
- * All S3 paths are provided via environment variables that mirror the
- * mix_maprule binary's own env var convention:
+ * Config mode is selected via PER_MAP_PER_CONFIG (default: false):
  *
- *   MIX_MAPRULE_IDIR          S3 prefix for stdtime.* input files
- *                               e.g. "Anirudh/fds"
- *   MIX_MAPRULE_ODIR          S3 prefix for output upload
- *                               e.g. "Anirudh/mix_output"
- *   MIX_MAPRULE_CONFIG        S3 path to the config file
- *                               e.g. "Anirudh/config.key2"
- *   MIX_MAPRULE_SUFFIX        Output suffix (optional).
- *                               Defaults to the config filename stripped of
- *                               its .config extension (and .keyN suffix).
+ *   PER_MAP_PER_CONFIG=true
+ *     Generates AddFD configs at runtime from the customer map file.
+ *     Requires: CUSTOMER_MAP_S3_KEY — S3 key of the customer map (e.g.
+ *       "fd_expansion_configs/fd_compute_customer_map.Key2").
+ *     One Spark task is created per network; output files are named
+ *     stdtime.<network>.key<N> (e.g. stdtime.v^f.key2).
+ *
+ *   PER_MAP_PER_CONFIG=false + MIX_MAPRULE_CONFIG set
+ *     Downloads config(s) from S3. MIX_MAPRULE_CONFIG may be a single S3
+ *     key or a glob pattern (e.g. "fd_config_from_map/N.key2").
+ *
+ *   PER_MAP_PER_CONFIG=false + MIX_MAPRULE_CONFIG not set
+ *     Loads static configs bundled in the JAR under fd_tools_config/.
+ *     All files listed in fd_tools_config/MANIFEST are loaded.
+ *
+ * Common env vars:
+ *   MIX_MAPRULE_IDIR               S3 prefix for stdtime.* input files
+ *   MIX_MAPRULE_ODIR               S3 prefix for output
+ *   MIX_MAPRULE_SUFFIX             Output suffix (optional, S3-config mode only)
  *   MIX_MAPRULE_THINNING_PCT_JUMP  Thinning pct (optional, default 0.0)
  *
  * Credentials / encryption:
@@ -60,7 +69,7 @@ object FDPipelineJob {
    * Defaults to "1" if no .keyN suffix found.
    */
   def keyIndexFromPath(path: String): String = {
-    val pattern = """\.key(\d+)$""".r
+    val pattern = """(?i)\.key(\d+)$""".r
     pattern.findFirstMatchIn(path).map(_.group(1)).getOrElse("1")
   }
 
@@ -192,14 +201,19 @@ object FDPipelineJob {
       System.err.println(
         "Usage: FDPipelineJob <s3Bucket> <encryptionKeysFile>\n" +
         "\n" +
-        "S3 paths are provided via environment variables:\n" +
-        "  MIX_MAPRULE_IDIR          S3 prefix for stdtime.* input files\n" +
-        "  MIX_MAPRULE_ODIR          S3 prefix for output\n" +
-        "  MIX_MAPRULE_CONFIG        S3 path to config file\n" +
-        "  MIX_MAPRULE_SUFFIX        Output suffix (optional)\n" +
-        "  MIX_MAPRULE_THINNING_PCT_JUMP  Thinning pct (optional, default 0.0)\n" +
+        "Config mode (PER_MAP_PER_CONFIG, default false):\n" +
+        "  true   Generate configs at runtime from CUSTOMER_MAP_S3_KEY\n" +
+        "  false  MIX_MAPRULE_CONFIG set → S3 download\n" +
+        "         MIX_MAPRULE_CONFIG unset → bundled JAR configs\n" +
         "\n" +
-        "Credentials:\n" +
+        "Env vars:\n" +
+        "  MIX_MAPRULE_IDIR               S3 prefix for stdtime.* input files\n" +
+        "  MIX_MAPRULE_ODIR               S3 prefix for output\n" +
+        "  PER_MAP_PER_CONFIG             true|false (default false)\n" +
+        "  CUSTOMER_MAP_S3_KEY            Required when PER_MAP_PER_CONFIG=true\n" +
+        "  MIX_MAPRULE_CONFIG             S3 config key or glob (PER_MAP_PER_CONFIG=false)\n" +
+        "  MIX_MAPRULE_SUFFIX             Output suffix override (S3-config mode only)\n" +
+        "  MIX_MAPRULE_THINNING_PCT_JUMP  Thinning pct (optional, default 0.0)\n" +
         "  S3_ACCESS_KEY, S3_SECRET_KEY, S3_OUTPUT_KEY_INDEX, S3_ENDPOINT\n"
       )
       System.exit(1)
@@ -236,26 +250,27 @@ object FDPipelineJob {
       throw new IllegalStateException("S3_SECRET_KEY env var not set"))
 
     // ------------------------------------------------------------------
-    // Read MIX_MAPRULE_* env vars
+    // Read required env vars
     // ------------------------------------------------------------------
-    val mixIdirRaw   = sys.env.getOrElse("MIX_MAPRULE_IDIR",
+    val mixIdirRaw = sys.env.getOrElse("MIX_MAPRULE_IDIR",
       throw new IllegalStateException("MIX_MAPRULE_IDIR env var not set"))
-    val mixOdirRaw   = sys.env.getOrElse("MIX_MAPRULE_ODIR",
+    val mixOdirRaw = sys.env.getOrElse("MIX_MAPRULE_ODIR",
       throw new IllegalStateException("MIX_MAPRULE_ODIR env var not set"))
-    val mixConfigKey = sys.env.getOrElse("MIX_MAPRULE_CONFIG",
-      throw new IllegalStateException("MIX_MAPRULE_CONFIG env var not set"))
+
+    val perMapPerConfig = sys.env.get("PER_MAP_PER_CONFIG")
+      .exists(v => v.equalsIgnoreCase("true") || v == "1")
+    val mixConfigKeyOpt = sys.env.get("MIX_MAPRULE_CONFIG").filter(_.nonEmpty)
+
+    val thinningPct = sys.env.get("MIX_MAPRULE_THINNING_PCT_JUMP")
+      .filter(_.nonEmpty).map(_.toDouble).getOrElse(0.0)
 
     // Strip any leading "s3://<bucket>/" or "s3a://<bucket>/" to get bare S3 keys
     val stripBucketPrefix = { raw: String =>
       val s3Pattern = s"^s3a?://${java.util.regex.Pattern.quote(s3Bucket)}/".r
       s3Pattern.replaceFirstIn(raw, "")
     }
-    val mixIdir    = stripBucketPrefix(mixIdirRaw).stripSuffix("/")
-    val mixOdir    = stripBucketPrefix(mixOdirRaw).stripSuffix("/")
-    val mixCfgKey  = stripBucketPrefix(mixConfigKey)
-
-    val thinningPct = sys.env.get("MIX_MAPRULE_THINNING_PCT_JUMP")
-      .filter(_.nonEmpty).map(_.toDouble).getOrElse(0.0)
+    val mixIdir = stripBucketPrefix(mixIdirRaw).stripSuffix("/")
+    val mixOdir = stripBucketPrefix(mixOdirRaw).stripSuffix("/")
 
     // ------------------------------------------------------------------
     // Load encryption keys
@@ -281,14 +296,19 @@ object FDPipelineJob {
     }
 
     // ------------------------------------------------------------------
-    // Resolve config files from S3.
-    // MIX_MAPRULE_CONFIG may be:
-    //   - a single S3 key:   "fd_tools_config/g27.mg1.key2"
-    //   - a glob pattern:    "fd_tools_config/g*.mg1.key2"
-    //                        "fd_tools_config/g*.mg1*"
-    // Glob: list S3, filter by pattern, download each — one task per config.
-    // Single: existing behaviour; MIX_MAPRULE_SUFFIX is honoured.
+    // Resolve config items — (suffix, configLines) per Spark task.
+    //
+    // Mode 1 PER_MAP_PER_CONFIG=true:
+    //   Download customer map from CUSTOMER_MAP_S3_KEY, generate one config
+    //   per network in-memory. Output files are named stdtime.<network>.
+    //
+    // Mode 2 MIX_MAPRULE_CONFIG set (PER_MAP_PER_CONFIG=false):
+    //   Download config(s) from S3. Supports single key or glob pattern.
+    //
+    // Mode 3 neither set:
+    //   Load static configs bundled in the JAR under fd_tools_config/.
     // ------------------------------------------------------------------
+
     def globToRegex(glob: String): java.util.regex.Pattern = {
       val sb = new StringBuilder("^")
       glob.foreach {
@@ -300,57 +320,126 @@ object FDPipelineJob {
       java.util.regex.Pattern.compile(sb.toString)
     }
 
-    val configItems: Seq[(String, String)] = if (mixCfgKey.contains("*")) {
-      val prefixUpToStar = mixCfgKey.substring(0, mixCfgKey.indexOf('*'))
-      // S3A needs a real directory path — strip back to the last slash
-      val listPrefix = prefixUpToStar.substring(0, prefixUpToStar.lastIndexOf('/') + 1)
-      val regex      = globToRegex(mixCfgKey)
-      println(s"[DEBUG] MIX_MAPRULE_CONFIG is a glob: $mixCfgKey")
-      println(s"[DEBUG] Scanning S3 under: s3://$s3Bucket/$listPrefix")
-      val matched = listS3Files(s3Bucket, listPrefix, listConf)
-        .map(_.stripPrefix(s"s3a://$s3Bucket/"))
-        .filter(k => regex.matcher(k).matches())
-        .sorted
-      println(s"[DEBUG] Matched ${matched.size} config file(s):")
-      matched.foreach(k => println(s"[DEBUG]   $k"))
-      matched.map { key =>
-        val fileName  = key.split("/").last
-        val keyIdx    = keyIndexFromPath(fileName)
-        val localName = stripKeyN(fileName)
-        val cfgSuffix = localName
-        val tmp = java.io.File.createTempFile("fd_cfg_", ".tmp")
-        val lines = try {
-          downloadS3File(s"s3a://$s3Bucket/$key", tmp,
-            s3aConf(accessKey, secretKey, encryptionKeys(keyIdx)))
-          scala.io.Source.fromFile(tmp).mkString
-        } finally tmp.delete()
-        println(s"[DEBUG]   → suffix='$cfgSuffix'  (${lines.linesIterator.size} config lines)")
-        (cfgSuffix, lines)
-      }
-    } else {
-      val cfgFileName  = mixCfgKey.split("/").last
-      val cfgKeyIdx    = keyIndexFromPath(cfgFileName)
-      val cfgLocalName = stripKeyN(cfgFileName)
-      val cfgSuffix = sys.env.get("MIX_MAPRULE_SUFFIX").filter(_.nonEmpty)
-        .getOrElse(cfgLocalName.stripSuffix(".config"))
-      println(s"[DEBUG] Downloading config from S3: s3://$s3Bucket/$mixCfgKey  (key index: $cfgKeyIdx)")
-      val tmp = java.io.File.createTempFile("fd_config_", ".tmp")
-      val lines: String = try {
-        downloadS3File(s"s3a://$s3Bucket/$mixCfgKey", tmp,
-          s3aConf(accessKey, secretKey, encryptionKeys(cfgKeyIdx)))
-        val l = scala.io.Source.fromFile(tmp).mkString
-        println(s"[DEBUG] Config file contents (${l.linesIterator.size} lines):")
-        l.linesIterator.foreach(ln => println(s"[DEBUG]   $ln"))
-        l
+    val configItems: Seq[(String, String)] = if (perMapPerConfig) {
+
+      // ── Mode 1: customer map ──────────────────────────────────────────
+      val customerMapKey = sys.env.getOrElse("CUSTOMER_MAP_S3_KEY",
+        throw new IllegalStateException(
+          "CUSTOMER_MAP_S3_KEY must be explicitly set when PER_MAP_PER_CONFIG=true"))
+      val bareKey = stripBucketPrefix(customerMapKey)
+      val keyIdx  = keyIndexFromPath(bareKey.split("/").last)
+
+      println(s"[DEBUG] Mode: PER_MAP_PER_CONFIG — customer map s3://$s3Bucket/$bareKey (key $keyIdx)")
+      val tmp = java.io.File.createTempFile("fd_customer_map_", ".tmp")
+      val mapContent = try {
+        downloadS3File(s"s3a://$s3Bucket/$bareKey", tmp,
+          s3aConf(accessKey, secretKey, encryptionKeys(keyIdx)))
+        scala.io.Source.fromFile(tmp).mkString
       } finally tmp.delete()
-      println(s"[DEBUG] Output suffix: '$cfgSuffix'  →  stdtime.$cfgSuffix")
-      Seq((cfgSuffix, lines))
+
+      // Parse customer map: group VCD extensions by network (alphabetical)
+      val networkToVcds = scala.collection.mutable.TreeMap[String, scala.collection.mutable.ArrayBuffer[String]]()
+      for (line <- mapContent.split("\\n").iterator) {
+        val trimmed = line.trim
+        if (trimmed.nonEmpty) {
+          val parts = trimmed.split("\\s+")
+          if (parts.length >= 4) {
+            val ext       = parts(3)
+            val lastCaret = ext.lastIndexOf('^')
+            if (lastCaret >= 0) {
+              val network = ext.substring(0, lastCaret)
+              networkToVcds.getOrElseUpdate(network, scala.collection.mutable.ArrayBuffer()) += ext
+            }
+          }
+        }
+      }
+
+      val items = networkToVcds.map { case (network, vcds) =>
+        val sortedLines = vcds.sorted.map(_ + " add 1").mkString("", "\n", "\n")
+        println(s"[DEBUG]   network=$network  vcds=${vcds.size}")
+        (network, sortedLines)
+      }.toSeq
+
+      println(s"[DEBUG] Generated ${items.size} configs from customer map")
+      items
+
+    } else if (mixConfigKeyOpt.isDefined) {
+
+      // ── Mode 2: S3 config (single key or glob) ────────────────────────
+      val mixCfgKey = stripBucketPrefix(mixConfigKeyOpt.get)
+      println(s"[DEBUG] Mode: S3 config — MIX_MAPRULE_CONFIG=s3://$s3Bucket/$mixCfgKey")
+
+      if (mixCfgKey.contains("*")) {
+        val prefixUpToStar = mixCfgKey.substring(0, mixCfgKey.indexOf('*'))
+        val listPrefix     = prefixUpToStar.substring(0, prefixUpToStar.lastIndexOf('/') + 1)
+        val regex          = globToRegex(mixCfgKey)
+        println(s"[DEBUG] Glob pattern — scanning s3://$s3Bucket/$listPrefix")
+        val matched = listS3Files(s3Bucket, listPrefix, listConf)
+          .map(_.stripPrefix(s"s3a://$s3Bucket/"))
+          .filter(k => regex.matcher(k).matches())
+          .sorted
+        println(s"[DEBUG] Matched ${matched.size} config file(s):")
+        matched.foreach(k => println(s"[DEBUG]   $k"))
+        matched.map { key =>
+          val fileName  = key.split("/").last
+          val cfgKeyIdx = keyIndexFromPath(fileName)
+          val cfgSuffix = stripKeyN(fileName)
+          val tmp       = java.io.File.createTempFile("fd_cfg_", ".tmp")
+          val lines = try {
+            downloadS3File(s"s3a://$s3Bucket/$key", tmp,
+              s3aConf(accessKey, secretKey, encryptionKeys(cfgKeyIdx)))
+            scala.io.Source.fromFile(tmp).mkString
+          } finally tmp.delete()
+          println(s"[DEBUG]   → suffix='$cfgSuffix'  (${lines.split("\\n").length} lines)")
+          (cfgSuffix, lines)
+        }
+      } else {
+        val cfgFileName  = mixCfgKey.split("/").last
+        val cfgKeyIdx    = keyIndexFromPath(cfgFileName)
+        val cfgLocalName = stripKeyN(cfgFileName)
+        val cfgSuffix    = sys.env.get("MIX_MAPRULE_SUFFIX").filter(_.nonEmpty)
+          .getOrElse(cfgLocalName.stripSuffix(".config"))
+        println(s"[DEBUG] Single config — key index $cfgKeyIdx  suffix='$cfgSuffix'")
+        val tmp = java.io.File.createTempFile("fd_config_", ".tmp")
+        val lines: String = try {
+          downloadS3File(s"s3a://$s3Bucket/$mixCfgKey", tmp,
+            s3aConf(accessKey, secretKey, encryptionKeys(cfgKeyIdx)))
+          val l = scala.io.Source.fromFile(tmp).mkString
+          println(s"[DEBUG] Config contents (${l.split("\\n").length} lines):")
+          l.split("\n").foreach(ln => println(s"[DEBUG]   $ln"))
+          l
+        } finally tmp.delete()
+        Seq((cfgSuffix, lines))
+      }
+
+    } else {
+
+      // ── Mode 3: bundled JAR configs ───────────────────────────────────
+      println(s"[DEBUG] Mode: bundled JAR configs (fd_tools_config/)")
+      val manifestStream = getClass.getResourceAsStream("/fd_tools_config/MANIFEST")
+      if (manifestStream == null)
+        throw new IllegalStateException(
+          "fd_tools_config/MANIFEST not found in JAR — rebuild with src/main/resources/fd_tools_config/ in place")
+      val manifest = scala.io.Source.fromInputStream(manifestStream)
+        .getLines().map(_.trim).filter(f => f.nonEmpty && f != "MANIFEST").toSeq
+      println(s"[DEBUG] Manifest: ${manifest.size} config file(s)")
+
+      manifest.flatMap { fname =>
+        val stream = getClass.getResourceAsStream(s"/fd_tools_config/$fname")
+        if (stream == null) {
+          println(s"[DEBUG] WARNING: $fname in manifest but missing from JAR — skipping")
+          None
+        } else {
+          val content = scala.io.Source.fromInputStream(stream).mkString
+          println(s"[DEBUG]   $fname  (${content.split("\\n").length} lines)")
+          Some((fname, content))
+        }
+      }
     }
 
     println(s"[DEBUG] Configs to process  : ${configItems.size}")
     println(s"[DEBUG] MIX_MAPRULE_IDIR   : s3://$s3Bucket/$mixIdir")
     println(s"[DEBUG] MIX_MAPRULE_ODIR   : s3://$s3Bucket/$mixOdir")
-    println(s"[DEBUG] MIX_MAPRULE_CONFIG : s3://$s3Bucket/$mixCfgKey")
     println(s"[DEBUG] Thinning pct       : $thinningPct")
 
     // ------------------------------------------------------------------
@@ -420,7 +509,7 @@ object FDPipelineJob {
         println(s"[$suffix] Local output dir : ${outputDir.getAbsolutePath}")
         println(s"[$suffix] Thinning pct     : $thinningPct")
         println(s"[$suffix] Config lines:")
-        configLines.linesIterator.foreach(l => println(s"[$suffix]   $l"))
+        configLines.split("\n").foreach(l => println(s"[$suffix]   $l"))
 
         try {
           // -- Stage 1: Download stdtime.* files using correct key per file --

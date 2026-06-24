@@ -2,16 +2,18 @@ name         := "fd-spark"
 version      := "0.1"
 scalaVersion := "2.13.17"
 
-// Spark 4.1.1 is "provided" on a real cluster — bundled for local dev runs
+// Spark 4.0.0 is "provided" on a real cluster — bundled for local dev runs
 val sparkScope = "provided" // change to "compile" temporarily to run via `sbt runMain`
 
 libraryDependencies ++= Seq(
-  "org.apache.spark" %% "spark-core"             % "4.1.1"   % sparkScope,
-  "org.apache.spark" %% "spark-sql"              % "4.1.1"   % sparkScope,
+  "org.apache.spark" %% "spark-core"             % "4.0.0"   % sparkScope,
+  "org.apache.spark" %% "spark-sql"              % "4.0.0"   % sparkScope,
   // S3A support for Linode Object Storage (provided at runtime via --packages)
   "org.apache.hadoop" %  "hadoop-aws"            % "3.3.6"   % "provided",
   "com.amazonaws"     %  "aws-java-sdk-bundle"   % "1.12.262" % "provided"
 )
+
+assembly / assemblyJarName := "fd-tools-spark-assembly.jar"
 
 // Make "provided" deps visible on the runtime classpath when using `sbt run`
 // (they are excluded from the assembly jar — only needed for local testing)

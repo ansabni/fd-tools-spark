@@ -44,7 +44,7 @@ spec:
   imagePullPolicy: IfNotPresent
 
   mainClass: com.fd.T2cJob
-  mainApplicationFile: "https://fds-jar.in-maa-1.linodeobjects.com/fd_tools_jar/fd-spark_2.13-0.1.jar"
+  mainApplicationFile: "https://fds-jar.in-maa-1.linodeobjects.com/fd_tools_jar/perMapPerConfig/fd-tools-spark-assembly.jar"
   sparkVersion: "4.0.0"
 
   restartPolicy:
