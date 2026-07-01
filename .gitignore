@@ -8,6 +8,7 @@ deploy/run-pipeline.local.sh
 deploy/run-unshard.local.sh
 deploy/run-t2s.local.sh
 deploy/run-t2c.local.sh
+deploy/run-batch-t2s.local.sh
 
 # SBT
 .bsp/
